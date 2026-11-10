@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+models/
+output/
+*.log
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+.pytest_cache/
+*.wav
+*.mp3
+*.mp4
+*.m4a
+*.webm
