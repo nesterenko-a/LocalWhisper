@@ -58,7 +58,7 @@ class JobStoreTests(unittest.TestCase):
             def engine(path, *settings, progress, on_partial):
                 self.assertEqual(Path(path).read_bytes(), b"recording")
                 progress(0.5, desc="halfway")
-                on_partial("partial text")
+                on_partial(dict(text="partial text", preview_data=dict(rows=[dict(start=0, end=1, speaker="Спикер 1", text="partial text")], aliases={}, hints=[])))
                 entered.set()
                 if not release.wait(5):
                     raise RuntimeError("test timeout")
@@ -75,6 +75,7 @@ class JobStoreTests(unittest.TestCase):
                 self.assertEqual(reconnected["state"], "running")
                 self.assertEqual(reconnected["text"], "partial text")
                 self.assertEqual(reconnected["progress"], 0.5)
+                self.assertIn("Спикер 1", store.formatted_text(identifier))
                 source.unlink()  # Browser upload may disappear; server copy remains.
             finally:
                 release.set()

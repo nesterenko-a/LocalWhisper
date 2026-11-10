@@ -47,7 +47,7 @@ def render_transcript(record=None, data=None):
     aliases = data.get("aliases", {})
     parts = [STYLE, '<section class="transcript-view" aria-label="Текст распознавания">']
     if record.get("state") != "done":
-        parts.append('<p class="view-note">Частичный результат. Разметка спикеров появится после завершения обработки.</p>')
+        parts.append('<p class="view-note">Частичный результат. Новые реплики появляются по мере распознавания; имена ещё могут уточняться.</p>')
     speakers = list(dict.fromkeys(row["speaker"] for row in rows if row.get("speaker")))
     if speakers:
         parts.append('<div class="transcript-legend" aria-label="Участники разговора">')

@@ -8,6 +8,37 @@ import app
 
 
 class AppTests(unittest.TestCase):
+    def test_speakers_arrive_before_transcription_finishes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = app.Path(folder) / "recording.wav"
+            source.touch()
+            partials, events = [], []
+
+            def segments():
+                yield SimpleNamespace(start=0, end=1, text="Привет.", words=[SimpleNamespace(start=0, end=1, word=" Привет.")])
+                self.assertEqual(partials[0]["preview_data"]["rows"][0]["speaker"], "Спикер 1")
+                self.assertNotIn("Спикер 2", partials[0]["text"])
+                yield SimpleNamespace(start=2, end=3, text="Здравствуйте.", words=[SimpleNamespace(start=2, end=3, word=" Здравствуйте.")])
+
+            model = unittest.mock.Mock()
+            model.transcribe.side_effect = lambda *args, **kwargs: (events.append("transcribe") or segments(), SimpleNamespace(language="ru", duration=3))
+
+            def voices(*args):
+                events.append("diarize")
+                return [(0, 1, "Спикер 1"), (2, 3, "Спикер 2")]
+
+            with patch.object(app, "WhisperModel", return_value=model), \
+                 patch.object(app, "cached_key", None), patch.object(app, "cached_model", None), \
+                 patch.object(app, "ensure_models", return_value=("seg", "emb")), \
+                 patch("faster_whisper.audio.decode_audio", return_value=[]), \
+                 patch.object(app, "diarize", side_effect=voices), \
+                 patch.object(app, "OUTPUT", app.Path(folder) / "results"):
+                text, files, _ = app.transcribe(str(source), "tiny", "Русский", "CPU", True, None, True, 2, on_partial=partials.append)
+            self.assertEqual(events, ["diarize", "transcribe"])
+            self.assertEqual(len(partials[0]["preview_data"]["rows"]), 1)
+            self.assertIn("Спикер 2", partials[-1]["text"])
+            self.assertEqual(text, partials[-1]["text"])
+
     def test_subtitle_timestamps_round_and_carry(self):
         self.assertEqual(app.timestamp(59.9996), "00:01:00,000")
         self.assertEqual(app.timestamp(3661.234, "."), "01:01:01.234")

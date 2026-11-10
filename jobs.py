@@ -13,6 +13,12 @@ class JobCancelled(Exception):
     pass
 
 
+def partial_changes(value):
+    if isinstance(value, dict):
+        return {"text": value["text"], "preview_data": value["preview_data"]}
+    return {"text": value}
+
+
 def _transcribe_process(source, settings, messages):
     """Heavy native inference lives in a killable child, not the web server."""
     from app import transcribe
@@ -114,7 +120,7 @@ class JobStore:
                 if kind == "progress":
                     update(progress=float(values[0]), status=values[1])
                 elif kind == "text":
-                    update(text=values[0])
+                    update(**partial_changes(values[0]))
                 elif kind == "result":
                     return values[0]
                 elif kind == "error":
@@ -162,7 +168,7 @@ class JobStore:
         from transcript_view import render_transcript
         with self.lock:
             record = self.records.get(identifier)
-            data = None
+            data = record.get("preview_data") if record else None
             if record and record["state"] == "done":
                 try:
                     _, _, data = self._metadata(identifier)
@@ -212,7 +218,7 @@ class JobStore:
             else:
                 text, files, status = self.transcribe(
                     record["source"], *record["settings"], progress=progress,
-                    on_partial=lambda text: update(text=text),
+                    on_partial=lambda value: update(**partial_changes(value)),
                 )
             if not isinstance(text, str) or not isinstance(files, list):
                 raise RuntimeError(status)

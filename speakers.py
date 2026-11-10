@@ -60,7 +60,7 @@ def diarize(audio, models, count, progress):
     engine = sherpa.OfflineSpeakerDiarization(config)
 
     def callback(done, total):
-        progress(0.6 + 0.35 * done / max(total, 1), desc="Разделение по голосам…")
+        progress(done / max(total, 1), desc="Определение спикеров по всей записи…")
         return 0
 
     turns = engine.process(audio, callback=callback).sort_by_start_time()

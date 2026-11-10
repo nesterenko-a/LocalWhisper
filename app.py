@@ -11,7 +11,7 @@ import uuid
 import gradio as gr
 from faster_whisper import WhisperModel
 from jobs import JobStore
-from speakers import timestamp, ensure_models, diarize, align_words, infer_names, export_transcript
+from speakers import timestamp, ensure_models, diarize, align_words, infer_names, export_transcript, speaker_text
 
 ROOT = Path(__file__).resolve().parent
 MODELS = ROOT / "models"
@@ -32,11 +32,18 @@ def transcribe(source, size, language, device, offline, prompt, separate_speaker
     with LOCK:
         try:
             speaker_models = None
+            turns = []
+            speech_start = 0.0
             if separate_speakers:
                 progress(0, desc="Подготовка моделей спикеров… Первая загрузка требует интернет.")
                 speaker_models = ensure_models(MODELS, offline)
+                from faster_whisper.audio import decode_audio
+                progress(0, desc="Определение спикеров по всей записи на CPU…")
+                turns = diarize(decode_audio(source, sampling_rate=16000), speaker_models, speaker_count,
+                                lambda value, desc="": progress(0.35 * value, desc=desc))
+                speech_start = 0.35
             if cached_key != key:
-                progress(0, desc="Загрузка модели… При первом использовании требуется интернет.")
+                progress(speech_start, desc="Загрузка модели… При первом использовании требуется интернет.")
                 cached_model = None
                 cached_key = None
                 cached_model = WhisperModel(
@@ -45,30 +52,32 @@ def transcribe(source, size, language, device, offline, prompt, separate_speaker
                     download_root=str(MODELS), local_files_only=offline,
                 )
                 cached_key = key
-            progress(0, desc="Распознавание речи…")
+            progress(speech_start, desc="Распознавание речи с разметкой спикеров…" if separate_speakers else "Распознавание речи…")
             segments, info = cached_model.transcribe(
                 source, language=None if language == "Авто" else {"Русский": "ru", "English": "en"}[language],
                 beam_size=5, vad_filter=True, initial_prompt=(prompt or "").strip() or None,
                 word_timestamps=separate_speakers,
             )
             rows = []
-            words = []
-            for segment in segments:
-                rows.append(dict(start=segment.start, end=segment.end, text=segment.text.strip()))
-                if separate_speakers:
-                    words.extend((word.start, word.end, word.word) for word in (segment.words or []))
-                if on_partial:
-                    on_partial("\n".join(row["text"] for row in rows))
-                progress(min(segment.end / max(info.duration, 1), 1) * (0.6 if separate_speakers else 1), desc=f"Обработано {segment.end:.0f} из {info.duration:.0f} с")
             aliases, hints = {}, []
-            if separate_speakers and rows:
-                from faster_whisper.audio import decode_audio
-                progress(0.6, desc="Разделение по голосам на CPU…")
-                turns = diarize(decode_audio(source, sampling_rate=16000), speaker_models, speaker_count, progress)
-                if not words:
-                    raise RuntimeError("Whisper не вернул временные отметки слов для разделения спикеров.")
-                rows = align_words(words, turns)
-                aliases, hints = infer_names(rows)
+            for segment in segments:
+                if separate_speakers:
+                    words = [(word.start, word.end, word.word) for word in (segment.words or [])]
+                    if segment.text.strip() and not words:
+                        raise RuntimeError("Whisper не вернул временные отметки слов для разделения спикеров.")
+                    additions = align_words(words, turns)
+                    if rows and additions and rows[-1]["speaker"] == additions[0]["speaker"] and additions[0]["start"] - rows[-1]["end"] < 1.5:
+                        first = additions.pop(0)
+                        rows[-1]["text"] += " " + first["text"]
+                        rows[-1]["end"] = first["end"]
+                    rows.extend(additions)
+                    aliases, hints = infer_names(rows)
+                else:
+                    rows.append(dict(start=segment.start, end=segment.end, text=segment.text.strip()))
+                if on_partial:
+                    on_partial(dict(text="\n".join(speaker_text(row, aliases) for row in rows),
+                                    preview_data=dict(rows=[dict(row) for row in rows], aliases=dict(aliases), hints=list(hints))))
+                progress(speech_start + min(segment.end / max(info.duration, 1), 1) * (1 - speech_start), desc=f"Обработано {segment.end:.0f} из {info.duration:.0f} с")
             OUTPUT.mkdir(exist_ok=True)
             folder = OUTPUT / (datetime.now().strftime("%Y-%m-%d_%H-%M-%S_") + uuid.uuid4().hex[:8])
             folder.mkdir()
