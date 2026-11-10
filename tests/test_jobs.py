@@ -1,12 +1,54 @@
 import tempfile
 import threading
 import unittest
+import time
+from unittest.mock import patch
 from pathlib import Path
 
 from jobs import JobStore
 
 
+def process_engine(source, settings, messages):
+    if settings[0] == "slow":
+        messages.put(("text", "saved partial text"))
+        time.sleep(30)
+    messages.put(("result", ("complete", [], "done")))
+
+
 class JobStoreTests(unittest.TestCase):
+    def wait_state(self, store, identifier, states):
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            record = store.snapshot(identifier)[1]
+            if record["state"] in states:
+                return record
+            time.sleep(.05)
+        self.fail(f"Timed out waiting for {states}: {record}")
+
+    def test_process_cancel_preserves_text_skips_queued_job_and_runs_next(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "voice.wav"
+            source.touch()
+            with patch("jobs._transcribe_process", process_engine):
+                store = JobStore(Path(folder) / "jobs", None, process_jobs=True)
+                running = store.submit(source, ["slow"])
+                queued = store.submit(source, ["fast"])
+                store.cancel(queued)
+                deadline = time.monotonic() + 15
+                while not store.snapshot(running)[1]["text"] and time.monotonic() < deadline:
+                    time.sleep(.05)
+                self.assertEqual(store.snapshot(running)[1]["text"], "saved partial text")
+                store.cancel(running)
+                cancelled = self.wait_state(store, running, {"cancelled"})
+                self.assertEqual(cancelled["text"], "saved partial text")
+                self.assertEqual(Path(cancelled["files"][0]).read_text(encoding="utf-8"), "saved partial text")
+                self.assertEqual(store.snapshot(queued)[1]["state"], "cancelled")
+                next_job = store.submit(source, ["fast"])
+                self.wait_state(store, next_job, {"done"})
+                store.cancel(next_job)  # Completed results must remain intact.
+                self.assertEqual(store.snapshot(next_job)[1]["state"], "done")
+                store.queue.join()
+
     def test_reconnect_progress_completion_and_restart_history(self):
         entered, release = threading.Event(), threading.Event()
         with tempfile.TemporaryDirectory() as folder:

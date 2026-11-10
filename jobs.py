@@ -6,13 +6,31 @@ import queue
 import shutil
 import threading
 import uuid
+import multiprocessing
+
+
+class JobCancelled(Exception):
+    pass
+
+
+def _transcribe_process(source, settings, messages):
+    """Heavy native inference lives in a killable child, not the web server."""
+    from app import transcribe
+    try:
+        result = transcribe(source, *settings,
+                            progress=lambda value, desc="": messages.put(("progress", value, desc)),
+                            on_partial=lambda text: messages.put(("text", text)))
+        messages.put(("result", result))
+    except Exception as exc:
+        messages.put(("error", str(exc)))
 
 
 class JobStore:
-    def __init__(self, root, transcribe):
+    def __init__(self, root, transcribe, process_jobs=False):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.transcribe = transcribe
+        self.process_jobs = process_jobs
         self.lock = threading.RLock()
         self.records = {}
         self.queue = queue.Queue()
@@ -20,7 +38,7 @@ class JobStore:
             try:
                 record = json.loads(path.read_text(encoding="utf-8"))
                 self.records[record["id"]] = record
-                if record["state"] in ("queued", "running"):
+                if record["state"] in ("queued", "running", "cancelling"):
                     record.update(state="interrupted", status="Прервано остановкой сервера. Запустите задачу заново.")
                     self._save(record)
             except (OSError, ValueError, KeyError):
@@ -59,6 +77,66 @@ class JobStore:
             # Copies prevent callers from modifying the worker's live state.
             return json.loads(json.dumps(records)), json.loads(json.dumps(selected))
 
+    def cancel(self, identifier):
+        with self.lock:
+            record = self.records.get(identifier)
+            if not record:
+                raise ValueError("Выберите задачу, которую нужно остановить.")
+            if record["state"] == "queued":
+                record.update(state="cancelled", status="Отменено до начала распознавания")
+            elif record["state"] == "running":
+                record.update(state="cancelling", status="Останавливается…")
+            else:
+                return
+            self._save(record)
+
+    def _check_cancelled(self, record):
+        with self.lock:
+            if record["state"] in ("cancelling", "cancelled"):
+                raise JobCancelled()
+
+    def _execute_process(self, record, update):
+        context = multiprocessing.get_context("spawn")
+        messages = context.Queue()
+        process = context.Process(target=_transcribe_process,
+                                  args=(record["source"], record["settings"], messages), daemon=True)
+        process.start()
+        try:
+            while True:
+                self._check_cancelled(record)
+                try:
+                    message = messages.get(timeout=0.2)
+                except queue.Empty:
+                    if not process.is_alive():
+                        raise RuntimeError(f"Процесс распознавания завершился без результата (код {process.exitcode}).")
+                    continue
+                kind, *values = message
+                if kind == "progress":
+                    update(progress=float(values[0]), status=values[1])
+                elif kind == "text":
+                    update(text=values[0])
+                elif kind == "result":
+                    return values[0]
+                elif kind == "error":
+                    raise RuntimeError(values[0])
+        finally:
+            if process.is_alive():
+                process.terminate()
+            process.join()
+            messages.close()
+
+    def _save_cancelled(self, record):
+        with self.lock:
+            files = record.get("files", [])
+            if record["text"]:
+                partial = self.root / record["id"] / "partial.txt"
+                partial.write_text(record["text"], encoding="utf-8")
+                files = [str(partial.resolve())]
+            status = "Остановлено пользователем."
+            status += " Сохранён частичный результат." if record["text"] else " Текст ещё не был получен."
+            record.update(state="cancelled", status=status, files=files)
+            self._save(record)
+
     def _metadata(self, identifier):
         record = self.records.get(identifier)
         if not record or record["state"] != "done":
@@ -79,6 +157,18 @@ class JobStore:
                 return "Задача обработана без разделения по спикерам."
             lines = [f"{label} = {data['aliases'].get(label, '')}" for label in known]
             return "\n".join(lines + [""] + data.get("hints", []))
+
+    def formatted_text(self, identifier):
+        from transcript_view import render_transcript
+        with self.lock:
+            record = self.records.get(identifier)
+            data = None
+            if record and record["state"] == "done":
+                try:
+                    _, _, data = self._metadata(identifier)
+                except (OSError, ValueError):
+                    pass
+            return render_transcript(record, data)
 
     def rename_speakers(self, identifier, mappings):
         from speakers import parse_aliases, export_transcript
@@ -104,6 +194,7 @@ class JobStore:
     def _run(self, identifier):
         def update(**changes):
             with self.lock:
+                self._check_cancelled(record)
                 record.update(changes)
                 self._save(record)
 
@@ -112,16 +203,28 @@ class JobStore:
 
         with self.lock:
             record = self.records[identifier]
+            if record["state"] == "cancelled":
+                return
         try:
             update(state="running", status="Запуск распознавания…")
-            text, files, status = self.transcribe(
-                record["source"], *record["settings"], progress=progress,
-                on_partial=lambda text: update(text=text),
-            )
+            if self.process_jobs:
+                text, files, status = self._execute_process(record, update)
+            else:
+                text, files, status = self.transcribe(
+                    record["source"], *record["settings"], progress=progress,
+                    on_partial=lambda text: update(text=text),
+                )
             if not isinstance(text, str) or not isinstance(files, list):
                 raise RuntimeError(status)
             update(state="done", text=text, files=files, status=status, progress=1)
+        except JobCancelled:
+            self._save_cancelled(record)
         except Exception as exc:
             import logging
             logging.exception("Job %s failed", identifier)
-            update(state="error", status=str(exc))
+            with self.lock:
+                if record["state"] == "cancelling":
+                    self._save_cancelled(record)
+                else:
+                    record.update(state="error", status=str(exc))
+                    self._save(record)

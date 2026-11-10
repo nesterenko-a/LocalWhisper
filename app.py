@@ -94,18 +94,19 @@ def get_jobs():
     global job_store
     with STORE_LOCK:
         if job_store is None:
-            job_store = JobStore(ROOT / "jobs", transcribe)
+            job_store = JobStore(ROOT / "jobs", transcribe, process_jobs=True)
         return job_store
 
 
 def refresh_job(selected=None):
     records, record = get_jobs().snapshot(selected)
-    labels = {"queued": "В очереди", "running": "В работе", "done": "Готово", "error": "Ошибка", "interrupted": "Прервано"}
+    labels = {"queued": "В очереди", "running": "В работе", "cancelling": "Останавливается", "cancelled": "Остановлено", "done": "Готово", "error": "Ошибка", "interrupted": "Прервано"}
     choices = [(f"{r['created'].replace('T', ' ')} · {r['name']} · {labels[r['state']]}", r["id"]) for r in reversed(records)]
     if record is None:
-        return gr.update(choices=choices, value=None), "Задач пока нет", "", []
+        from transcript_view import render_transcript
+        return gr.update(choices=choices, value=None), "Задач пока нет", "", [], render_transcript()
     status = f"{labels[record['state']]} • {record['progress']:.0%} • {record['status']}"
-    return gr.update(choices=choices, value=record["id"]), status, record["text"], record["files"]
+    return gr.update(choices=choices, value=record["id"]), status, record["text"], record["files"], get_jobs().formatted_text(record["id"])
 
 
 def speaker_details(selected=None):
@@ -130,6 +131,14 @@ def submit_job(source, size, language, device, offline, prompt, separate_speaker
     except (OSError, ValueError) as exc:
         raise gr.Error(str(exc)) from exc
     return refresh_job(identifier)
+
+
+def cancel_job(selected):
+    try:
+        get_jobs().cancel(selected)
+    except ValueError as exc:
+        raise gr.Error(str(exc)) from exc
+    return refresh_job(selected)
 
 
 def build_ui():
@@ -157,13 +166,19 @@ def build_ui():
             with gr.Tab("Аудио / видео файл"):
                 source = gr.File(label="Перетащите аудио или видео", type="filepath", file_count="single")
                 file_button = gr.Button("Распознать файл", variant="primary")
+                file_stop = gr.Button("Остановить распознавание", variant="stop")
             with gr.Tab("Микрофон"):
                 microphone = gr.Audio(sources=["microphone"], type="filepath", label="Запишите речь и остановите запись")
                 mic_button = gr.Button("Распознать запись", variant="primary")
+                mic_stop = gr.Button("Остановить распознавание", variant="stop")
         gr.Markdown("### Задачи\nМожно закрыть вкладку и вернуться позже: задача продолжит работать, пока запущен сервер.")
+        gr.Markdown("Кнопка «Остановить распознавание» отменяет задачу, выбранную в истории ниже. Уже полученный текст сохраняется; задача из очереди отменяется до запуска.")
         selected_job = gr.Dropdown(label="Текущая задача и история", choices=[], interactive=True)
         status = gr.Textbox(label="Статус", value="Загрузка задач…", interactive=False)
-        result = gr.Textbox(label="Текст", lines=14, buttons=["copy"], interactive=False)
+        gr.Markdown("### Текст")
+        formatted = gr.HTML()
+        with gr.Accordion("Обычный текст — копирование", open=False):
+            result = gr.Textbox(label="Текст без оформления", lines=14, buttons=["copy"], interactive=False)
         downloads = gr.File(label="Скачать TXT / SRT / VTT / JSON", file_count="multiple", interactive=False)
         with gr.Accordion("Имена и должности спикеров", open=False):
             details = gr.Textbox(label="Спикеры и подсказки из разговора", lines=5, interactive=False)
@@ -171,8 +186,10 @@ def build_ui():
             rename_button = gr.Button("Применить имена к выбранной задаче")
             gr.Markdown("Явное «меня зовут…» используется для имени автоматически. Обращения к собеседнику — только подсказки. Проверьте имена по записи. Ручные правки обновят текст и все файлы; пустое имя после = вернёт номер спикера.")
         for button, audio in [(file_button, source), (mic_button, microphone)]:
-            button.click(submit_job, [audio, size, language, device, offline, prompt, separate_speakers, speaker_count], [selected_job, status, result, downloads], concurrency_limit=1, concurrency_id="submit-job")
-        outputs = [selected_job, status, result, downloads]
+            button.click(submit_job, [audio, size, language, device, offline, prompt, separate_speakers, speaker_count], [selected_job, status, result, downloads, formatted], concurrency_limit=1, concurrency_id="submit-job")
+        outputs = [selected_job, status, result, downloads, formatted]
+        for stop_button in (file_stop, mic_stop):
+            stop_button.click(cancel_job, [selected_job], outputs, queue=False)
         demo.load(refresh_job, [selected_job], outputs, queue=False)
         selected_job.input(refresh_job, [selected_job], outputs, queue=False)
         gr.Timer(2).tick(refresh_job, [selected_job], outputs, queue=False, show_progress="hidden")
