@@ -10,6 +10,7 @@ import uuid
 
 import gradio as gr
 from faster_whisper import WhisperModel
+from jobs import JobStore
 
 ROOT = Path(__file__).resolve().parent
 MODELS = ROOT / "models"
@@ -17,6 +18,8 @@ OUTPUT = ROOT / "output"
 LOCK = threading.Lock()
 cached_key = None
 cached_model = None
+job_store = None
+STORE_LOCK = threading.Lock()
 
 
 def timestamp(seconds, separator=","):
@@ -27,7 +30,7 @@ def timestamp(seconds, separator=","):
     return f"{hours:02}:{minutes:02}:{seconds:02}{separator}{ms:03}"
 
 
-def transcribe(source, size, language, device, offline, prompt, progress=gr.Progress()):
+def transcribe(source, size, language, device, offline, prompt, progress=gr.Progress(), on_partial=None):
     global cached_key, cached_model
     if not source or not Path(source).is_file():
         raise gr.Error("Загрузите файл или запишите голос перед распознаванием.")
@@ -53,6 +56,8 @@ def transcribe(source, size, language, device, offline, prompt, progress=gr.Prog
             rows = []
             for segment in segments:
                 rows.append((segment.start, segment.end, segment.text.strip()))
+                if on_partial:
+                    on_partial("\n".join(row[2] for row in rows))
                 progress(min(segment.end / max(info.duration, 1), 1), desc=f"Обработано {segment.end:.0f} из {info.duration:.0f} с")
             text = "\n".join(row[2] for row in rows)
             OUTPUT.mkdir(exist_ok=True)
@@ -75,6 +80,32 @@ def transcribe(source, size, language, device, offline, prompt, progress=gr.Prog
             elif offline:
                 hint = " Для первой загрузки этой модели снимите флажок «Только офлайн»."
             return gr.skip(), gr.skip(), f"Не удалось распознать запись: {exc}.{hint}"
+
+
+def get_jobs():
+    global job_store
+    with STORE_LOCK:
+        if job_store is None:
+            job_store = JobStore(ROOT / "jobs", transcribe)
+        return job_store
+
+
+def refresh_job(selected=None):
+    records, record = get_jobs().snapshot(selected)
+    labels = {"queued": "В очереди", "running": "В работе", "done": "Готово", "error": "Ошибка", "interrupted": "Прервано"}
+    choices = [(f"{r['created'].replace('T', ' ')} · {r['name']} · {labels[r['state']]}", r["id"]) for r in reversed(records)]
+    if record is None:
+        return gr.update(choices=choices, value=None), "Задач пока нет", "", []
+    status = f"{labels[record['state']]} • {record['progress']:.0%} • {record['status']}"
+    return gr.update(choices=choices, value=record["id"]), status, record["text"], record["files"]
+
+
+def submit_job(source, size, language, device, offline, prompt):
+    try:
+        identifier = get_jobs().submit(source, (size, language, device, offline, prompt))
+    except (OSError, ValueError) as exc:
+        raise gr.Error(str(exc)) from exc
+    return refresh_job(identifier)
 
 
 def build_ui():
@@ -101,11 +132,17 @@ def build_ui():
             with gr.Tab("Микрофон"):
                 microphone = gr.Audio(sources=["microphone"], type="filepath", label="Запишите речь и остановите запись")
                 mic_button = gr.Button("Распознать запись", variant="primary")
-        status = gr.Textbox(label="Статус", value="Выберите файл или запишите речь", interactive=False)
-        result = gr.Textbox(label="Текст", lines=14, buttons=["copy"])
+        gr.Markdown("### Задачи\nМожно закрыть вкладку и вернуться позже: задача продолжит работать, пока запущен сервер.")
+        selected_job = gr.Dropdown(label="Текущая задача и история", choices=[], interactive=True)
+        status = gr.Textbox(label="Статус", value="Загрузка задач…", interactive=False)
+        result = gr.Textbox(label="Текст", lines=14, buttons=["copy"], interactive=False)
         downloads = gr.File(label="Скачать TXT / SRT / VTT", file_count="multiple", interactive=False)
         for button, audio in [(file_button, source), (mic_button, microphone)]:
-            button.click(transcribe, [audio, size, language, device, offline, prompt], [result, downloads, status], concurrency_limit=1, concurrency_id="whisper")
+            button.click(submit_job, [audio, size, language, device, offline, prompt], [selected_job, status, result, downloads], concurrency_limit=1, concurrency_id="submit-job")
+        outputs = [selected_job, status, result, downloads]
+        demo.load(refresh_job, [selected_job], outputs, queue=False)
+        selected_job.input(refresh_job, [selected_job], outputs, queue=False)
+        gr.Timer(2).tick(refresh_job, [selected_job], outputs, queue=False, show_progress="hidden")
     return demo
 
 
