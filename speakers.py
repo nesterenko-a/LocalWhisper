@@ -43,7 +43,7 @@ def _download(url, destination):
         shutil.copyfileobj(response, output)
 
 
-def diarize(audio, models, count, progress):
+def create_diarizer(models, count=0):
     import sherpa_onnx as sherpa
     segmentation, embedding = models
     config = sherpa.OfflineSpeakerDiarizationConfig(
@@ -57,7 +57,11 @@ def diarize(audio, models, count, progress):
     )
     if not config.validate():
         raise RuntimeError("Не удалось настроить модели разделения спикеров.")
-    engine = sherpa.OfflineSpeakerDiarization(config)
+    return sherpa.OfflineSpeakerDiarization(config)
+
+
+def diarize(audio, models, count, progress):
+    engine = create_diarizer(models, count)
 
     def callback(done, total):
         progress(done / max(total, 1), desc="Определение спикеров по всей записи…")
@@ -71,6 +75,88 @@ def diarize(audio, models, count, progress):
         label = labels.setdefault(turn.speaker, f"Спикер {len(labels) + 1}")
         result.append((turn.start, turn.end, label))
     return result
+
+
+class SpeakerTracker:
+    """Match local clusters to recording-wide voices using normalized embeddings."""
+    def __init__(self, maximum=0, threshold=0.55):
+        self.maximum = int(maximum or 0)
+        self.threshold = threshold
+        self.voices = []
+
+    def match(self, embeddings):
+        import numpy as np
+        vectors = {}
+        for label, value in embeddings.items():
+            vector = np.asarray(value, dtype=np.float32)
+            norm = np.linalg.norm(vector)
+            if norm > 1e-8 and np.isfinite(vector).all():
+                vectors[label] = vector / norm
+        matches, used = {}, set()
+        pairs = sorted(((float(vector @ reference), label, index)
+                        for label, vector in vectors.items() for index, reference in enumerate(self.voices)), reverse=True)
+        for score, label, index in pairs:
+            if score >= self.threshold and label not in matches and index not in used:
+                matches[label] = index
+                used.add(index)
+        for label, vector in vectors.items():
+            if label not in matches:
+                if self.maximum and len(self.voices) >= self.maximum:
+                    continue
+                matches[label] = len(self.voices)
+                self.voices.append(vector)
+            else:
+                index = matches[label]
+                average = self.voices[index] * .9 + vector * .1
+                self.voices[index] = average / np.linalg.norm(average)
+        return {label: f"Спикер {index + 1}" for label, index in matches.items()}
+
+
+class BufferedDiarizer:
+    def __init__(self, models, count=0):
+        import sherpa_onnx as sherpa
+        self.engine = create_diarizer(models)  # Local speaker count may differ from the whole recording.
+        self.extractor = sherpa.SpeakerEmbeddingExtractor(sherpa.SpeakerEmbeddingExtractorConfig(
+            model=str(models[1]), num_threads=2, provider="cpu"))
+        self.tracker = SpeakerTracker(count)
+
+    def refine(self, audio):
+        turns = self.engine.process(audio).sort_by_start_time()
+        durations = {}
+        for turn in turns:
+            durations[turn.speaker] = durations.get(turn.speaker, 0) + turn.end - turn.start
+        allowed = set(sorted(durations, key=durations.get, reverse=True)[:self.tracker.maximum]) if self.tracker.maximum else set(durations)
+        labels = {}
+        result = []
+        for turn in turns:
+            if turn.speaker not in labels:
+                labels[turn.speaker] = (f"Спикер {sum(value != 'Спикер неизвестен' for value in labels.values()) + 1}"
+                                        if turn.speaker in allowed
+                                        else "Спикер неизвестен")
+            result.append((turn.start, turn.end, labels[turn.speaker]))
+        return result
+
+    def analyze(self, audio):
+        import numpy as np
+        turns = self.engine.process(audio).sort_by_start_time()
+        clips = {}
+        for turn in turns:
+            # Avoid contaminated speaker samples where local voices overlap.
+            if turn.end - turn.start < .6 or any(
+                other.speaker != turn.speaker and min(turn.end, other.end) > max(turn.start, other.start)
+                for other in turns
+            ):
+                continue
+            clips.setdefault(turn.speaker, []).append(audio[int(turn.start * 16000):int(turn.end * 16000)])
+        embeddings = {}
+        for label, pieces in clips.items():
+            stream = self.extractor.create_stream()
+            stream.accept_waveform(sample_rate=16000, waveform=np.concatenate(pieces)[:240000])
+            stream.input_finished()
+            if self.extractor.is_ready(stream):
+                embeddings[label] = self.extractor.compute(stream)
+        labels = self.tracker.match(embeddings)
+        return [(turn.start, turn.end, labels.get(turn.speaker, "Спикер неизвестен")) for turn in turns]
 
 
 def align_words(words, turns):

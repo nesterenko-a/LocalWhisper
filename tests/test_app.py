@@ -27,14 +27,20 @@ class AppTests(unittest.TestCase):
                 events.append("diarize")
                 return [(0, 1, "Спикер 1"), (2, 3, "Спикер 2")]
 
+            import numpy as np
+            analyzer = unittest.mock.Mock()
+            analyzer.analyze.side_effect = voices
+            analyzer.refine.side_effect = voices
+            from buffered import recognize
+
             with patch.object(app, "WhisperModel", return_value=model), \
                  patch.object(app, "cached_key", None), patch.object(app, "cached_model", None), \
                  patch.object(app, "ensure_models", return_value=("seg", "emb")), \
-                 patch("faster_whisper.audio.decode_audio", return_value=[]), \
-                 patch.object(app, "diarize", side_effect=voices), \
+                 patch("faster_whisper.audio.decode_audio", return_value=np.zeros(48000, dtype=np.float32)), \
+                 patch.object(app, "recognize_buffers", side_effect=lambda *args: recognize(*args, analyzer=analyzer)), \
                  patch.object(app, "OUTPUT", app.Path(folder) / "results"):
                 text, files, _ = app.transcribe(str(source), "tiny", "Русский", "CPU", True, None, True, 2, on_partial=partials.append)
-            self.assertEqual(events, ["diarize", "transcribe"])
+            self.assertEqual(events, ["diarize", "transcribe", "diarize"])
             self.assertEqual(len(partials[0]["preview_data"]["rows"]), 1)
             self.assertIn("Спикер 2", partials[-1]["text"])
             self.assertEqual(text, partials[-1]["text"])

@@ -8,6 +8,9 @@ import threading
 import uuid
 import multiprocessing
 import time
+import os
+import subprocess
+import signal
 from storage import atomic_json
 
 
@@ -24,6 +27,8 @@ def partial_changes(value):
 def _transcribe_process(source, settings, messages):
     """Heavy native inference lives in a killable child, not the web server."""
     from app import transcribe
+    if os.name != "nt":
+        os.setsid()
     try:
         result = transcribe(source, *settings,
                             progress=lambda value, desc="": messages.put(("progress", value, desc)),
@@ -135,7 +140,7 @@ class JobStore:
         context = multiprocessing.get_context("spawn")
         messages = context.Queue()
         process = context.Process(target=_transcribe_process,
-                                  args=(record["source"], record["settings"], messages), daemon=True)
+                                  args=(record["source"], record["settings"], messages), daemon=False)
         process.start()
         try:
             while True:
@@ -157,7 +162,17 @@ class JobStore:
                     raise RuntimeError(values[0])
         finally:
             if process.is_alive():
-                process.terminate()
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   creationflags=subprocess.CREATE_NO_WINDOW, check=False)
+                else:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                if process.is_alive():
+                    process.terminate()
             process.join()
             messages.close()
 

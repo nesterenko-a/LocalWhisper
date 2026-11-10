@@ -11,7 +11,8 @@ import uuid
 import gradio as gr
 from faster_whisper import WhisperModel
 from jobs import JobStore
-from speakers import timestamp, ensure_models, diarize, align_words, infer_names, export_transcript, speaker_text
+from speakers import timestamp, ensure_models, export_transcript
+from buffered import recognize as recognize_buffers
 
 ROOT = Path(__file__).resolve().parent
 MODELS = ROOT / "models"
@@ -32,18 +33,11 @@ def transcribe(source, size, language, device, offline, prompt, separate_speaker
     with LOCK:
         try:
             speaker_models = None
-            turns = []
-            speech_start = 0.0
             if separate_speakers:
                 progress(0, desc="Подготовка моделей спикеров… Первая загрузка требует интернет.")
                 speaker_models = ensure_models(MODELS, offline)
-                from faster_whisper.audio import decode_audio
-                progress(0, desc="Определение спикеров по всей записи на CPU…")
-                turns = diarize(decode_audio(source, sampling_rate=16000), speaker_models, speaker_count,
-                                lambda value, desc="": progress(0.35 * value, desc=desc))
-                speech_start = 0.35
             if cached_key != key:
-                progress(speech_start, desc="Загрузка модели… При первом использовании требуется интернет.")
+                progress(0, desc="Загрузка модели… При первом использовании требуется интернет.")
                 cached_model = None
                 cached_key = None
                 cached_model = WhisperModel(
@@ -52,32 +46,24 @@ def transcribe(source, size, language, device, offline, prompt, separate_speaker
                     download_root=str(MODELS), local_files_only=offline,
                 )
                 cached_key = key
-            progress(speech_start, desc="Распознавание речи с разметкой спикеров…" if separate_speakers else "Распознавание речи…")
-            segments, info = cached_model.transcribe(
-                source, language=None if language == "Авто" else {"Русский": "ru", "English": "en"}[language],
-                beam_size=5, vad_filter=True, initial_prompt=(prompt or "").strip() or None,
-                word_timestamps=separate_speakers,
-            )
-            rows = []
-            aliases, hints = {}, []
-            for segment in segments:
-                if separate_speakers:
-                    words = [(word.start, word.end, word.word) for word in (segment.words or [])]
-                    if segment.text.strip() and not words:
-                        raise RuntimeError("Whisper не вернул временные отметки слов для разделения спикеров.")
-                    additions = align_words(words, turns)
-                    if rows and additions and rows[-1]["speaker"] == additions[0]["speaker"] and additions[0]["start"] - rows[-1]["end"] < 1.5:
-                        first = additions.pop(0)
-                        rows[-1]["text"] += " " + first["text"]
-                        rows[-1]["end"] = first["end"]
-                    rows.extend(additions)
-                    aliases, hints = infer_names(rows)
-                else:
+            selected_language = None if language == "Авто" else {"Русский": "ru", "English": "en"}[language]
+            initial_prompt = (prompt or "").strip() or None
+            if separate_speakers:
+                from faster_whisper.audio import decode_audio
+                progress(0, desc="Чтение аудио для буферной обработки…")
+                rows, aliases, hints, info = recognize_buffers(cached_model, decode_audio(source, sampling_rate=16000),
+                                                              speaker_models, speaker_count, selected_language,
+                                                              initial_prompt, progress, on_partial)
+            else:
+                progress(0, desc="Распознавание речи…")
+                segments, info = cached_model.transcribe(source, language=selected_language, beam_size=5,
+                                                         vad_filter=True, initial_prompt=initial_prompt)
+                rows, aliases, hints = [], {}, []
+                for segment in segments:
                     rows.append(dict(start=segment.start, end=segment.end, text=segment.text.strip()))
-                if on_partial:
-                    on_partial(dict(text="\n".join(speaker_text(row, aliases) for row in rows),
-                                    preview_data=dict(rows=[dict(row) for row in rows], aliases=dict(aliases), hints=list(hints))))
-                progress(speech_start + min(segment.end / max(info.duration, 1), 1) * (1 - speech_start), desc=f"Обработано {segment.end:.0f} из {info.duration:.0f} с")
+                    if on_partial:
+                        on_partial(dict(text="\n".join(row["text"] for row in rows), preview_data=dict(rows=[dict(row) for row in rows], aliases={}, hints=[])))
+                    progress(min(segment.end / max(info.duration, 1), 1), desc=f"Обработано {segment.end:.0f} из {info.duration:.0f} с")
             OUTPUT.mkdir(exist_ok=True)
             folder = OUTPUT / (datetime.now().strftime("%Y-%m-%d_%H-%M-%S_") + uuid.uuid4().hex[:8])
             folder.mkdir()
@@ -171,8 +157,8 @@ def build_ui():
             gr.Markdown("Модели хранятся в `models`, результаты — в `output` рядом с приложением. Выбранное устройство применяется к следующему распознаванию.")
         with gr.Accordion("Спикеры", open=False):
             separate_speakers = gr.Checkbox(False, label="Разделять по спикерам")
-            speaker_count = gr.Number(value=0, precision=0, minimum=0, maximum=30, label="Число участников (0 — определить автоматически)")
-            gr.Markdown("Разделение голосов работает локально на CPU и увеличивает время обработки. При первом использовании скачаются дополнительные модели. Одновременная речь и похожие голоса могут разделяться неточно.")
+            speaker_count = gr.Number(value=0, precision=0, minimum=0, maximum=30, label="Максимум участников (0 — без ограничения)")
+            gr.Markdown("Обработка буферами: около 5% записи, от 30 до 120 секунд. Whisper распознаёт готовый буфер, голоса следующего определяются параллельно на CPU. В конце — уточнение голосов по всей записи. Предварительная разметка может измениться; короткие реплики, похожие голоса и одновременная речь могут разделяться неточно.")
         with gr.Tabs():
             with gr.Tab("Аудио / видео файл"):
                 source = gr.File(label="Перетащите аудио или видео", type="filepath", file_count="single")
