@@ -49,7 +49,7 @@ class AppTests(unittest.TestCase):
                 text, files, status = app.transcribe(str(source), "tiny", "Русский", "CPU", True, None)
                 self.assertEqual(text, "Привет.")
                 self.assertIsNone(model.transcribe.call_args.kwargs["initial_prompt"])
-                self.assertEqual(len(files), 3)
+                self.assertEqual(len(files), 4)
                 self.assertTrue(all(app.Path(path).is_file() for path in files))
 
     def test_failure_preserves_previous_result(self):

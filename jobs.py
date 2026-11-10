@@ -59,6 +59,40 @@ class JobStore:
             # Copies prevent callers from modifying the worker's live state.
             return json.loads(json.dumps(records)), json.loads(json.dumps(selected))
 
+    def _metadata(self, identifier):
+        record = self.records.get(identifier)
+        if not record or record["state"] != "done":
+            raise ValueError("Выберите завершённую задачу с разделением спикеров.")
+        paths = [Path(p) for p in record["files"] if Path(p).suffix == ".json"]
+        if not paths:
+            raise ValueError("У этой задачи нет данных спикеров. Запустите её с разделением по спикерам.")
+        return record, paths[0], json.loads(paths[0].read_text(encoding="utf-8"))
+
+    def speaker_details(self, identifier):
+        with self.lock:
+            try:
+                _, _, data = self._metadata(identifier)
+            except (ValueError, OSError):
+                return "У этой задачи нет данных спикеров."
+            known = list(dict.fromkeys(row["speaker"] for row in data["rows"] if row.get("speaker")))
+            if not known:
+                return "Задача обработана без разделения по спикерам."
+            lines = [f"{label} = {data['aliases'].get(label, '')}" for label in known]
+            return "\n".join(lines + [""] + data.get("hints", []))
+
+    def rename_speakers(self, identifier, mappings):
+        from speakers import parse_aliases, export_transcript
+        with self.lock:
+            record, path, data = self._metadata(identifier)
+            known = {row["speaker"] for row in data["rows"] if row.get("speaker")}
+            changes = parse_aliases(mappings, known)
+            if not changes:
+                raise ValueError("Введите хотя бы одну строку, например: Спикер 1 = Алексей")
+            data["aliases"].update(changes)
+            text, files = export_transcript(path.parent, data["rows"], data["aliases"], data.get("hints", []))
+            record.update(text=text, files=files)
+            self._save(record)
+
     def _worker(self):
         while True:
             identifier = self.queue.get()

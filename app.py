@@ -11,6 +11,7 @@ import uuid
 import gradio as gr
 from faster_whisper import WhisperModel
 from jobs import JobStore
+from speakers import timestamp, ensure_models, diarize, align_words, infer_names, export_transcript
 
 ROOT = Path(__file__).resolve().parent
 MODELS = ROOT / "models"
@@ -22,15 +23,7 @@ job_store = None
 STORE_LOCK = threading.Lock()
 
 
-def timestamp(seconds, separator=","):
-    ms = max(0, round(seconds * 1000))
-    hours, ms = divmod(ms, 3600000)
-    minutes, ms = divmod(ms, 60000)
-    seconds, ms = divmod(ms, 1000)
-    return f"{hours:02}:{minutes:02}:{seconds:02}{separator}{ms:03}"
-
-
-def transcribe(source, size, language, device, offline, prompt, progress=gr.Progress(), on_partial=None):
+def transcribe(source, size, language, device, offline, prompt, separate_speakers=False, speaker_count=0, progress=gr.Progress(), on_partial=None):
     global cached_key, cached_model
     if not source or not Path(source).is_file():
         raise gr.Error("Загрузите файл или запишите голос перед распознаванием.")
@@ -38,6 +31,10 @@ def transcribe(source, size, language, device, offline, prompt, progress=gr.Prog
     key = (size, target, offline)
     with LOCK:
         try:
+            speaker_models = None
+            if separate_speakers:
+                progress(0, desc="Подготовка моделей спикеров… Первая загрузка требует интернет.")
+                speaker_models = ensure_models(MODELS, offline)
             if cached_key != key:
                 progress(0, desc="Загрузка модели… При первом использовании требуется интернет.")
                 cached_model = None
@@ -52,25 +49,36 @@ def transcribe(source, size, language, device, offline, prompt, progress=gr.Prog
             segments, info = cached_model.transcribe(
                 source, language=None if language == "Авто" else {"Русский": "ru", "English": "en"}[language],
                 beam_size=5, vad_filter=True, initial_prompt=(prompt or "").strip() or None,
+                word_timestamps=separate_speakers,
             )
             rows = []
+            words = []
             for segment in segments:
-                rows.append((segment.start, segment.end, segment.text.strip()))
+                rows.append(dict(start=segment.start, end=segment.end, text=segment.text.strip()))
+                if separate_speakers:
+                    words.extend((word.start, word.end, word.word) for word in (segment.words or []))
                 if on_partial:
-                    on_partial("\n".join(row[2] for row in rows))
-                progress(min(segment.end / max(info.duration, 1), 1), desc=f"Обработано {segment.end:.0f} из {info.duration:.0f} с")
-            text = "\n".join(row[2] for row in rows)
+                    on_partial("\n".join(row["text"] for row in rows))
+                progress(min(segment.end / max(info.duration, 1), 1) * (0.6 if separate_speakers else 1), desc=f"Обработано {segment.end:.0f} из {info.duration:.0f} с")
+            aliases, hints = {}, []
+            if separate_speakers and rows:
+                from faster_whisper.audio import decode_audio
+                progress(0.6, desc="Разделение по голосам на CPU…")
+                turns = diarize(decode_audio(source, sampling_rate=16000), speaker_models, speaker_count, progress)
+                if not words:
+                    raise RuntimeError("Whisper не вернул временные отметки слов для разделения спикеров.")
+                rows = align_words(words, turns)
+                aliases, hints = infer_names(rows)
             OUTPUT.mkdir(exist_ok=True)
             folder = OUTPUT / (datetime.now().strftime("%Y-%m-%d_%H-%M-%S_") + uuid.uuid4().hex[:8])
             folder.mkdir()
-            txt, srt, vtt = [folder / f"transcript.{ext}" for ext in ("txt", "srt", "vtt")]
-            txt.write_text(text, encoding="utf-8")
-            srt.write_text("\n\n".join(f"{i}\n{timestamp(a)} --> {timestamp(b)}\n{t}" for i, (a, b, t) in enumerate(rows, 1)) + "\n", encoding="utf-8")
-            vtt.write_text("WEBVTT\n\n" + "\n\n".join(f"{timestamp(a, '.')} --> {timestamp(b, '.')}\n{t}" for a, b, t in rows) + "\n", encoding="utf-8")
+            text, files = export_transcript(folder, rows, aliases, hints)
             status = f"Готово • язык: {info.language} • длительность: {info.duration:.1f} с • {size} / {target}"
             if not rows:
                 status += " • Речь не обнаружена"
-            return text, [str(txt), str(srt), str(vtt)], status
+            elif separate_speakers:
+                status += " • Спикеры разделены; проверьте имена и границы реплик"
+            return text, files, status
         except Exception as exc:
             import logging
             logging.exception("Transcription failed")
@@ -100,9 +108,25 @@ def refresh_job(selected=None):
     return gr.update(choices=choices, value=record["id"]), status, record["text"], record["files"]
 
 
-def submit_job(source, size, language, device, offline, prompt):
+def speaker_details(selected=None):
+    _, record = get_jobs().snapshot(selected)
+    if not record or record["state"] != "done":
+        return "Имена и подсказки появятся после завершения задачи."
+    details = get_jobs().speaker_details(record["id"])
+    return details
+
+
+def rename_speakers(selected, mappings):
     try:
-        identifier = get_jobs().submit(source, (size, language, device, offline, prompt))
+        get_jobs().rename_speakers(selected, mappings)
+    except (ValueError, OSError) as exc:
+        raise gr.Error(str(exc)) from exc
+    return (*refresh_job(selected), speaker_details(selected))
+
+
+def submit_job(source, size, language, device, offline, prompt, separate_speakers=False, speaker_count=0):
+    try:
+        identifier = get_jobs().submit(source, (size, language, device, offline, prompt, separate_speakers, speaker_count))
     except (OSError, ValueError) as exc:
         raise gr.Error(str(exc)) from exc
     return refresh_job(identifier)
@@ -125,6 +149,10 @@ def build_ui():
             offline = gr.Checkbox(False, label="Только офлайн — использовать уже скачанные модели")
             prompt = gr.Textbox(value="", label="Термины и имена для подсказки", placeholder="Например: Kubernetes, Алексей, название компании")
             gr.Markdown("Модели хранятся в `models`, результаты — в `output` рядом с приложением. Выбранное устройство применяется к следующему распознаванию.")
+        with gr.Accordion("Спикеры", open=False):
+            separate_speakers = gr.Checkbox(False, label="Разделять по спикерам")
+            speaker_count = gr.Number(value=0, precision=0, minimum=0, maximum=30, label="Число участников (0 — определить автоматически)")
+            gr.Markdown("Разделение голосов работает локально на CPU и увеличивает время обработки. При первом использовании скачаются дополнительные модели. Одновременная речь и похожие голоса могут разделяться неточно.")
         with gr.Tabs():
             with gr.Tab("Аудио / видео файл"):
                 source = gr.File(label="Перетащите аудио или видео", type="filepath", file_count="single")
@@ -136,13 +164,22 @@ def build_ui():
         selected_job = gr.Dropdown(label="Текущая задача и история", choices=[], interactive=True)
         status = gr.Textbox(label="Статус", value="Загрузка задач…", interactive=False)
         result = gr.Textbox(label="Текст", lines=14, buttons=["copy"], interactive=False)
-        downloads = gr.File(label="Скачать TXT / SRT / VTT", file_count="multiple", interactive=False)
+        downloads = gr.File(label="Скачать TXT / SRT / VTT / JSON", file_count="multiple", interactive=False)
+        with gr.Accordion("Имена и должности спикеров", open=False):
+            details = gr.Textbox(label="Спикеры и подсказки из разговора", lines=5, interactive=False)
+            mappings = gr.Textbox(value="", label="Переименовать спикеров (по одному на строку)", placeholder="Спикер 1 = Алексей\nСпикер 2 = Руководитель проекта", lines=4)
+            rename_button = gr.Button("Применить имена к выбранной задаче")
+            gr.Markdown("Явное «меня зовут…» используется для имени автоматически. Обращения к собеседнику — только подсказки. Проверьте имена по записи. Ручные правки обновят текст и все файлы; пустое имя после = вернёт номер спикера.")
         for button, audio in [(file_button, source), (mic_button, microphone)]:
-            button.click(submit_job, [audio, size, language, device, offline, prompt], [selected_job, status, result, downloads], concurrency_limit=1, concurrency_id="submit-job")
+            button.click(submit_job, [audio, size, language, device, offline, prompt, separate_speakers, speaker_count], [selected_job, status, result, downloads], concurrency_limit=1, concurrency_id="submit-job")
         outputs = [selected_job, status, result, downloads]
         demo.load(refresh_job, [selected_job], outputs, queue=False)
         selected_job.input(refresh_job, [selected_job], outputs, queue=False)
         gr.Timer(2).tick(refresh_job, [selected_job], outputs, queue=False, show_progress="hidden")
+        demo.load(speaker_details, [selected_job], [details], queue=False)
+        gr.Timer(2).tick(speaker_details, [selected_job], [details], queue=False, show_progress="hidden")
+        selected_job.input(speaker_details, [selected_job], [details], queue=False)
+        rename_button.click(rename_speakers, [selected_job, mappings], [*outputs, details])
     return demo
 
 

@@ -1,3 +1,4 @@
 faster-whisper==1.2.1
 gradio==6.31.0
 av==16.0.1
+sherpa-onnx==2.0.1
