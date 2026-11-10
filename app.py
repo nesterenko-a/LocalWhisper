@@ -80,10 +80,16 @@ def transcribe(source, size, language, device, offline, prompt, progress=gr.Prog
 def build_ui():
     with gr.Blocks(title="Локальный Whisper") as demo:
         gr.Markdown("# Локальный Whisper\nАудио и видео в текст. Распознавание выполняется на этом компьютере.")
-        with gr.Row():
-            size = gr.Dropdown(["tiny", "base", "small", "medium", "large-v3", "turbo"], value="small", label="Модель", info="tiny/base — быстрее; small — баланс; large-v3 — точнее и требовательнее")
-            language = gr.Dropdown(["Авто", "Русский", "English"], value="Русский", label="Язык речи")
-            device = gr.Dropdown(["CPU", "NVIDIA GPU (CUDA)"], value="CPU", label="Устройство", info="Для GPU нужны совместимая NVIDIA, CUDA 12 и cuDNN 9")
+        with gr.Row(equal_height=True):
+            with gr.Column(min_width=200):
+                size = gr.Dropdown(["tiny", "base", "small", "medium", "large-v3", "turbo"], value="small", label="Модель")
+                gr.Markdown("tiny/base — быстрее; small — баланс; large-v3 — точнее и требовательнее")
+            with gr.Column(min_width=200):
+                language = gr.Dropdown(["Авто", "Русский", "English"], value="Русский", label="Язык речи")
+                gr.Markdown("Выберите язык записи или автоопределение.")
+            with gr.Column(min_width=200):
+                device = gr.Dropdown(["CPU", "NVIDIA GPU (CUDA)"], value="CPU", label="Устройство")
+                gr.Markdown("Для GPU нужны совместимая NVIDIA, CUDA 12 и cuDNN 9")
         with gr.Accordion("Дополнительные настройки", open=False):
             offline = gr.Checkbox(False, label="Только офлайн — использовать уже скачанные модели")
             prompt = gr.Textbox(value="", label="Термины и имена для подсказки", placeholder="Например: Kubernetes, Алексей, название компании")
