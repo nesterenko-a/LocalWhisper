@@ -136,6 +136,30 @@ def rename_speakers(selected, mappings):
     return (*refresh_job(selected), speaker_details(selected), "Имена применены. Текст и файлы обновлены.")
 
 
+def merge_controls(selected, sources, target):
+    choices = get_jobs().speaker_choices(selected)
+    known = {value for _, value in choices}
+    return (gr.update(choices=choices, value=[value for value in (sources or []) if value in known]),
+            gr.update(choices=choices, value=target if target in known else None),
+            gr.update(interactive=len(known) >= 2))
+
+
+def merge_speakers(selected, sources, target):
+    try:
+        get_jobs().merge_speakers(selected, sources, target)
+    except (ValueError, OSError) as exc:
+        return (*[gr.skip() for _ in range(6)], f"Спикеры не объединены: {exc}")
+    return (*refresh_job(selected), speaker_details(selected), f"Спикеры объединены в {target}. Текст и файлы обновлены.")
+
+
+def undo_merge(selected):
+    try:
+        get_jobs().undo_speaker_merge(selected)
+    except (ValueError, OSError) as exc:
+        return (*[gr.skip() for _ in range(6)], f"Не удалось отменить объединение: {exc}")
+    return (*refresh_job(selected), speaker_details(selected), "Последнее объединение отменено. Текст и файлы восстановлены.")
+
+
 def submit_job(source, size, language, device, offline, prompt, separate_speakers=False, speaker_count=0):
     try:
         identifier = get_jobs().submit(source, (size, language, device, offline, prompt, separate_speakers, speaker_count))
@@ -197,6 +221,15 @@ def build_ui():
             rename_button = gr.Button("Применить имена к выбранной задаче", interactive=False)
             rename_feedback = gr.Textbox(label="Результат применения имён", interactive=False)
             gr.Markdown("Явное «меня зовут…» используется для имени автоматически. Обращения к собеседнику — только подсказки. Проверьте имена по записи. Ручные правки обновят текст и все файлы; пустое имя после = вернёт номер спикера.")
+        with gr.Accordion("Объединить спикеров", open=False):
+            gr.Markdown("Если один человек получил несколько номеров, выберите лишние номера и спикера, которого нужно оставить. Например: Спикер 10 → Спикер 3. Доступно после завершения задачи.")
+            with gr.Row():
+                merge_sources = gr.Dropdown(choices=[], multiselect=True, label="Кого объединить")
+                merge_target = gr.Dropdown(choices=[], label="В кого объединить (сохранить номер и цвет)")
+            merge_button = gr.Button("Объединить выбранных спикеров", interactive=False)
+            undo_merge_button = gr.Button("Отменить последнее объединение")
+            merge_feedback = gr.Textbox(label="Результат объединения", interactive=False)
+            gr.Markdown("Обновляются текст, цвета и все файлы без повторного распознавания. Сохраняется имя целевого спикера. Отмена возвращает разметку и имена к состоянию перед последним объединением, включая последующие правки имён.")
         for button, audio in [(file_button, source), (mic_button, microphone)]:
             button.click(submit_job, [audio, size, language, device, offline, prompt, separate_speakers, speaker_count], [selected_job, status, result, downloads, formatted], concurrency_limit=1, concurrency_id="submit-job")
         outputs = [selected_job, status, result, downloads, formatted]
@@ -210,6 +243,13 @@ def build_ui():
         selected_job.input(speaker_controls, [selected_job], [details, rename_button], queue=False)
         selected_job.input(lambda: "", outputs=[rename_feedback], queue=False)
         rename_button.click(rename_speakers, [selected_job, mappings], [*outputs, details, rename_feedback])
+        merge_inputs = [selected_job, merge_sources, merge_target]
+        merge_outputs = [merge_sources, merge_target, merge_button]
+        demo.load(merge_controls, merge_inputs, merge_outputs, queue=False)
+        gr.Timer(2).tick(merge_controls, merge_inputs, merge_outputs, queue=False, show_progress="hidden")
+        selected_job.input(lambda: (gr.update(value=[]), gr.update(value=None), ""), outputs=[merge_sources, merge_target, merge_feedback], queue=False)
+        merge_button.click(merge_speakers, merge_inputs, [*outputs, details, merge_feedback]).then(merge_controls, merge_inputs, merge_outputs, queue=False)
+        undo_merge_button.click(undo_merge, [selected_job], [*outputs, details, merge_feedback]).then(merge_controls, merge_inputs, merge_outputs, queue=False)
     return demo
 
 

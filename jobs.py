@@ -217,6 +217,57 @@ class JobStore:
             except (OSError, ValueError, KeyError):
                 return False
 
+    def speaker_choices(self, identifier):
+        with self.lock:
+            try:
+                _, _, data = self._metadata(identifier)
+            except (OSError, ValueError):
+                return []
+            labels = list(dict.fromkeys(row["speaker"] for row in data["rows"] if row.get("speaker")))
+            return [(f"{label} — {data['aliases'][label]}" if data["aliases"].get(label) else label, label) for label in labels]
+
+    def _apply_speaker_data(self, record, path, data):
+        from speakers import export_transcript
+        text, files = export_transcript(path.parent, data["rows"], data["aliases"], data.get("hints", []))
+        record.update(text=text, files=files)
+        self._save(record)
+
+    def merge_speakers(self, identifier, sources, target):
+        from speakers import infer_names
+        with self.lock:
+            record, path, data = self._metadata(identifier)
+            known = {row["speaker"] for row in data["rows"] if row.get("speaker")}
+            sources = set(sources or [])
+            if not sources or not target:
+                raise ValueError("Выберите спикеров для объединения и спикера, которого нужно оставить.")
+            if target not in known or not sources.issubset(known):
+                raise ValueError("Список спикеров изменился. Выберите их заново.")
+            sources.discard(target)
+            if not sources:
+                raise ValueError("Для объединения выберите другого спикера.")
+            atomic_json(path.parent / "before-merge.json", data)
+            if not data["aliases"].get(target):
+                inherited = [data["aliases"][label] for label in known if label in sources and data["aliases"].get(label)]
+                if len(set(inherited)) == 1:
+                    data["aliases"][target] = inherited[0]
+            for row in data["rows"]:
+                if row.get("speaker") in sources:
+                    row["speaker"] = target
+            for label in sources:
+                data["aliases"].pop(label, None)
+            _, data["hints"] = infer_names(data["rows"])
+            self._apply_speaker_data(record, path, data)
+
+    def undo_speaker_merge(self, identifier):
+        with self.lock:
+            record, path, _ = self._metadata(identifier)
+            backup = path.parent / "before-merge.json"
+            if not backup.is_file():
+                raise ValueError("У выбранной задачи нет объединения для отмены.")
+            data = json.loads(backup.read_text(encoding="utf-8"))
+            self._apply_speaker_data(record, path, data)
+            backup.unlink()
+
     def formatted_text(self, identifier):
         from transcript_view import render_transcript
         with self.lock:

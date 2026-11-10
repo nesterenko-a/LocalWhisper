@@ -8,6 +8,15 @@ import app
 
 
 class AppTests(unittest.TestCase):
+    def test_merge_validation_is_inline_and_preserves_result(self):
+        store = unittest.mock.Mock()
+        store.merge_speakers.side_effect = ValueError("Выберите другого спикера")
+        with patch.object(app, "get_jobs", return_value=store):
+            result = app.merge_speakers("task", ["Спикер 3"], "Спикер 3")
+        self.assertEqual(len(result), 7)
+        self.assertTrue(all(value == app.gr.skip() for value in result[:6]))
+        self.assertIn("Спикеры не объединены", result[-1])
+
     def test_rename_controls_disabled_until_final_result(self):
         store = unittest.mock.Mock()
         store.snapshot.return_value = ([], dict(id="job", state="running"))
