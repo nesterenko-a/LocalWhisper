@@ -48,7 +48,7 @@ def transcribe(source, size, language, device, offline, prompt, progress=gr.Prog
             progress(0, desc="Распознавание речи…")
             segments, info = cached_model.transcribe(
                 source, language=None if language == "Авто" else {"Русский": "ru", "English": "en"}[language],
-                beam_size=5, vad_filter=True, initial_prompt=prompt.strip() or None,
+                beam_size=5, vad_filter=True, initial_prompt=(prompt or "").strip() or None,
             )
             rows = []
             for segment in segments:
@@ -74,7 +74,7 @@ def transcribe(source, size, language, device, offline, prompt, progress=gr.Prog
                 hint = " Проверьте совместимость NVIDIA GPU, драйвер, CUDA 12 и cuDNN 9 либо выберите CPU."
             elif offline:
                 hint = " Для первой загрузки этой модели снимите флажок «Только офлайн»."
-            raise gr.Error(f"Не удалось распознать запись: {exc}.{hint}") from exc
+            return gr.skip(), gr.skip(), f"Не удалось распознать запись: {exc}.{hint}"
 
 
 def build_ui():
@@ -86,7 +86,7 @@ def build_ui():
             device = gr.Dropdown(["CPU", "NVIDIA GPU (CUDA)"], value="CPU", label="Устройство", info="Для GPU нужны совместимая NVIDIA, CUDA 12 и cuDNN 9")
         with gr.Accordion("Дополнительные настройки", open=False):
             offline = gr.Checkbox(False, label="Только офлайн — использовать уже скачанные модели")
-            prompt = gr.Textbox(label="Термины и имена для подсказки", placeholder="Например: Kubernetes, Алексей, название компании")
+            prompt = gr.Textbox(value="", label="Термины и имена для подсказки", placeholder="Например: Kubernetes, Алексей, название компании")
             gr.Markdown("Модели хранятся в `models`, результаты — в `output` рядом с приложением. Выбранное устройство применяется к следующему распознаванию.")
         with gr.Tabs():
             with gr.Tab("Аудио / видео файл"):

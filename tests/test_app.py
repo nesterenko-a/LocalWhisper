@@ -1,6 +1,7 @@
 import unittest
 import tempfile
 import wave
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import app
@@ -31,6 +32,38 @@ class AppTests(unittest.TestCase):
                 audio.setframerate(16000)
                 audio.writeframes(b"\0\0" * 16000)
             self.assertEqual(len(decode_audio(path)), 16000)
+
+    def test_empty_browser_prompt_and_export(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = app.Path(folder) / "recording.wav"
+            source.touch()
+            model = unittest.mock.Mock()
+            model.transcribe.return_value = (
+                iter([SimpleNamespace(start=0, end=1, text=" Привет. ")]),
+                SimpleNamespace(language="ru", duration=1),
+            )
+            with patch.object(app, "WhisperModel", return_value=model), \
+                 patch.object(app, "cached_key", None), \
+                 patch.object(app, "cached_model", None), \
+                 patch.object(app, "OUTPUT", app.Path(folder) / "results"):
+                text, files, status = app.transcribe(str(source), "tiny", "Русский", "CPU", True, None)
+                self.assertEqual(text, "Привет.")
+                self.assertIsNone(model.transcribe.call_args.kwargs["initial_prompt"])
+                self.assertEqual(len(files), 3)
+                self.assertTrue(all(app.Path(path).is_file() for path in files))
+
+    def test_failure_preserves_previous_result(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = app.Path(folder) / "recording.wav"
+            source.touch()
+            with patch.object(app, "WhisperModel", side_effect=RuntimeError("test failure")), \
+                 patch.object(app, "cached_key", None), \
+                 patch.object(app, "cached_model", None), \
+                 self.assertLogs(level="ERROR"):
+                text, files, status = app.transcribe(str(source), "tiny", "Русский", "CPU", True, None)
+            self.assertEqual(text, app.gr.skip())
+            self.assertEqual(files, app.gr.skip())
+            self.assertIn("test failure", status)
 
 
 if __name__ == "__main__":
