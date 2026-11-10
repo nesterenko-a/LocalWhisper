@@ -209,6 +209,14 @@ class JobStore:
             lines = [f"{label} = {data['aliases'].get(label, '')}" for label in known]
             return "\n".join(lines + [""] + data.get("hints", []))
 
+    def can_rename_speakers(self, identifier):
+        with self.lock:
+            try:
+                _, _, data = self._metadata(identifier)
+                return any(row.get("speaker") for row in data["rows"])
+            except (OSError, ValueError, KeyError):
+                return False
+
     def formatted_text(self, identifier):
         from transcript_view import render_transcript
         with self.lock:

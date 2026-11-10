@@ -8,6 +8,29 @@ import app
 
 
 class AppTests(unittest.TestCase):
+    def test_rename_controls_disabled_until_final_result(self):
+        store = unittest.mock.Mock()
+        store.snapshot.return_value = ([], dict(id="job", state="running"))
+        store.can_rename_speakers.return_value = False
+        with patch.object(app, "get_jobs", return_value=store):
+            message, button = app.speaker_controls("job")
+            self.assertFalse(button["interactive"])
+            self.assertIn("финальное", message)
+            store.snapshot.return_value = ([], dict(id="job", state="done"))
+            store.can_rename_speakers.return_value = True
+            store.speaker_details.return_value = "Спикер 1"
+            _, button = app.speaker_controls("job")
+            self.assertTrue(button["interactive"])
+
+    def test_rename_validation_keeps_text_and_reports_without_exception(self):
+        store = unittest.mock.Mock()
+        store.rename_speakers.side_effect = ValueError("Выберите завершённую задачу")
+        with patch.object(app, "get_jobs", return_value=store):
+            result = app.rename_speakers(None, "Спикер 1 = Алексей")
+        self.assertEqual(len(result), 7)
+        self.assertTrue(all(item == app.gr.skip() for item in result[:6]))
+        self.assertIn("Имена не применены", result[-1])
+
     def test_speakers_arrive_before_transcription_finishes(self):
         with tempfile.TemporaryDirectory() as folder:
             source = app.Path(folder) / "recording.wav"

@@ -114,12 +114,26 @@ def speaker_details(selected=None):
     return details
 
 
+def speaker_controls(selected=None):
+    _, record = get_jobs().snapshot(selected)
+    ready = bool(record and get_jobs().can_rename_speakers(record["id"]))
+    if not record:
+        message = "Выберите задачу в истории."
+    elif record["state"] in ("queued", "running", "cancelling"):
+        message = "Имена можно применить после статуса «Готово», когда закончится финальное уточнение спикеров. Введённые имена можно подготовить заранее."
+    elif record["state"] != "done":
+        message = "Задача не завершена. Для переименования спикеров дождитесь успешного завершения распознавания."
+    else:
+        message = get_jobs().speaker_details(record["id"])
+    return message, gr.update(interactive=ready)
+
+
 def rename_speakers(selected, mappings):
     try:
         get_jobs().rename_speakers(selected, mappings)
     except (ValueError, OSError) as exc:
-        raise gr.Error(str(exc)) from exc
-    return (*refresh_job(selected), speaker_details(selected))
+        return (*[gr.skip() for _ in range(6)], f"Имена не применены: {exc}")
+    return (*refresh_job(selected), speaker_details(selected), "Имена применены. Текст и файлы обновлены.")
 
 
 def submit_job(source, size, language, device, offline, prompt, separate_speakers=False, speaker_count=0):
@@ -180,7 +194,8 @@ def build_ui():
         with gr.Accordion("Имена и должности спикеров", open=False):
             details = gr.Textbox(label="Спикеры и подсказки из разговора", lines=5, interactive=False)
             mappings = gr.Textbox(value="", label="Переименовать спикеров (по одному на строку)", placeholder="Спикер 1 = Алексей\nСпикер 2 = Руководитель проекта", lines=4)
-            rename_button = gr.Button("Применить имена к выбранной задаче")
+            rename_button = gr.Button("Применить имена к выбранной задаче", interactive=False)
+            rename_feedback = gr.Textbox(label="Результат применения имён", interactive=False)
             gr.Markdown("Явное «меня зовут…» используется для имени автоматически. Обращения к собеседнику — только подсказки. Проверьте имена по записи. Ручные правки обновят текст и все файлы; пустое имя после = вернёт номер спикера.")
         for button, audio in [(file_button, source), (mic_button, microphone)]:
             button.click(submit_job, [audio, size, language, device, offline, prompt, separate_speakers, speaker_count], [selected_job, status, result, downloads, formatted], concurrency_limit=1, concurrency_id="submit-job")
@@ -190,10 +205,11 @@ def build_ui():
         demo.load(refresh_job, [selected_job], outputs, queue=False)
         selected_job.input(refresh_job, [selected_job], outputs, queue=False)
         gr.Timer(2).tick(refresh_job, [selected_job], outputs, queue=False, show_progress="hidden")
-        demo.load(speaker_details, [selected_job], [details], queue=False)
-        gr.Timer(2).tick(speaker_details, [selected_job], [details], queue=False, show_progress="hidden")
-        selected_job.input(speaker_details, [selected_job], [details], queue=False)
-        rename_button.click(rename_speakers, [selected_job, mappings], [*outputs, details])
+        demo.load(speaker_controls, [selected_job], [details, rename_button], queue=False)
+        gr.Timer(2).tick(speaker_controls, [selected_job], [details, rename_button], queue=False, show_progress="hidden")
+        selected_job.input(speaker_controls, [selected_job], [details, rename_button], queue=False)
+        selected_job.input(lambda: "", outputs=[rename_feedback], queue=False)
+        rename_button.click(rename_speakers, [selected_job, mappings], [*outputs, details, rename_feedback])
     return demo
 
 
