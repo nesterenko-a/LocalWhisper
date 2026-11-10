@@ -7,6 +7,8 @@ import shutil
 import threading
 import uuid
 import multiprocessing
+import time
+from storage import atomic_json
 
 
 class JobCancelled(Exception):
@@ -39,6 +41,8 @@ class JobStore:
         self.process_jobs = process_jobs
         self.lock = threading.RLock()
         self.records = {}
+        self.dirty = set()
+        self.save_event = threading.Event()
         self.queue = queue.Queue()
         for path in sorted(self.root.glob("*/job.json")):
             try:
@@ -51,12 +55,34 @@ class JobStore:
                 import logging
                 logging.exception("Cannot load job %s", path)
         threading.Thread(target=self._worker, daemon=True, name="whisper-jobs").start()
+        threading.Thread(target=self._retry_saves, daemon=True, name="whisper-save-retry").start()
 
-    def _save(self, record):
-        path = self.root / record["id"] / "job.json"
-        temporary = path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(path)
+    def _save(self, record, strict=False):
+        with self.lock:
+            record.pop("persistence_error", None)
+            try:
+                atomic_json(self.root / record["id"] / "job.json", record)
+            except OSError as exc:
+                if strict:
+                    raise
+                record["persistence_error"] = str(exc)
+                self.dirty.add(record["id"])
+                self.save_event.set()
+                import logging
+                logging.warning("Job %s remains in memory; saving will be retried: %s", record["id"], exc)
+                return False
+            self.dirty.discard(record["id"])
+            return True
+
+    def _retry_saves(self):
+        while True:
+            self.save_event.wait()
+            time.sleep(1)
+            with self.lock:
+                for identifier in list(self.dirty):
+                    self._save(self.records[identifier])
+                if not self.dirty:
+                    self.save_event.clear()
 
     def submit(self, source, settings):
         if not source or not Path(source).is_file():
@@ -72,7 +98,11 @@ class JobStore:
                       status="В очереди", progress=0, text="", files=[])
         with self.lock:
             self.records[identifier] = record
-            self._save(record)
+            try:
+                self._save(record, strict=True)
+            except OSError:
+                del self.records[identifier]
+                raise
             self.queue.put(identifier)
         return identifier
 
@@ -198,11 +228,17 @@ class JobStore:
                 self.queue.task_done()
 
     def _run(self, identifier):
+        last_progress_save = 0.0
+
         def update(**changes):
+            nonlocal last_progress_save
             with self.lock:
                 self._check_cancelled(record)
                 record.update(changes)
-                self._save(record)
+                now = time.monotonic()
+                if "state" in changes or "text" in changes or now - last_progress_save >= 1:
+                    self._save(record)
+                    last_progress_save = now
 
         def progress(value, desc=""):
             update(progress=float(value), status=desc)

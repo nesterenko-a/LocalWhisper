@@ -115,6 +115,8 @@ def refresh_job(selected=None):
         from transcript_view import render_transcript
         return gr.update(choices=choices, value=None), "Задач пока нет", "", [], render_transcript()
     status = f"{labels[record['state']]} • {record['progress']:.0%} • {record['status']}"
+    if record.get("persistence_error"):
+        status += " • Не удаётся сохранить историю на диск; повторяем запись. До сохранения не закрывайте сервер."
     return gr.update(choices=choices, value=record["id"]), status, record["text"], record["files"], get_jobs().formatted_text(record["id"])
 
 
